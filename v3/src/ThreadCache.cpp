@@ -1,5 +1,6 @@
 #include "../include/ThreadCache.h"
 #include "../include/CentralCache.h"
+#include <cstdlib>
 
 namespace Kama_memoryPool
 {
@@ -15,7 +16,7 @@ void* ThreadCache::allocate(size_t size)
     if (size > MAX_BYTES)
     {
         // 大对象直接从系统分配
-        return malloc(size);
+        return std::malloc(size);
     }
 
     size_t index = SizeClass::getIndex(size);
@@ -39,7 +40,7 @@ void ThreadCache::deallocate(void* ptr, size_t size)
 {
     if (size > MAX_BYTES)
     {
-        free(ptr);
+        std::free(ptr);
         return;
     }
 
@@ -159,8 +160,8 @@ size_t ThreadCache::getBatchNum(size_t size)
     // 计算最大批量数
     size_t maxNum = std::max(size_t(1), MAX_BATCH_SIZE / size);
 
-    // 取最小值，但确保至少返回1
-    return std::max(sizeof(1), std::min(maxNum, baseNum));
+    // 取最小值，但确保至少返回4
+    return std::max(sizeof(4), std::min(maxNum, baseNum));
 }
 
 } // namespace memoryPool

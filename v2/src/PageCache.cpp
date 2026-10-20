@@ -5,11 +5,13 @@
 namespace Kama_memoryPool
 {
 
+// 查找、分割或申请新的 Span
 void* PageCache::allocateSpan(size_t numPages)
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // 查找合适的空闲span
+    // freeSpans_是 map<size_t, Span*>，key是span的页数，value是对应的Span*链表头指针
     // lower_bound函数返回第一个大于等于numPages的元素的迭代器
     auto it = freeSpans_.lower_bound(numPages);
     if (it != freeSpans_.end())
@@ -17,8 +19,8 @@ void* PageCache::allocateSpan(size_t numPages)
         Span* span = it->second;
 
         // 将取出的span从原有的空闲链表freeSpans_[it->first]中移除
-        if (span->next)
-        {
+        if (span->next) {
+            // span->next不为空，说明链表中还有其他span，将链表头指针更新为下一个span
             freeSpans_[it->first] = span->next;
         }
         else
@@ -40,6 +42,8 @@ void* PageCache::allocateSpan(size_t numPages)
             newSpan->next = list;
             list = newSpan;
 
+            // 记录这个剩余 Span 的起始地址
+            spanMap_[newSpan->pageAddr] = newSpan;
             span->numPages = numPages;
         }
 
@@ -63,6 +67,7 @@ void* PageCache::allocateSpan(size_t numPages)
     return memory;
 }
 
+// 回收和合并空闲 Span
 void PageCache::deallocateSpan(void* ptr, size_t numPages)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -83,29 +88,40 @@ void PageCache::deallocateSpan(void* ptr, size_t numPages)
         
         // 1. 首先检查nextSpan是否在空闲链表中
         bool found = false;
-        auto& nextList = freeSpans_[nextSpan->numPages];
-        
-        // 检查是否是头节点
-        if (nextList == nextSpan)
+        // auto& nextList = freeSpans_[nextSpan->numPages];
+        auto it = freeSpans_.find(nextSpan->numPages);
+        if (it != freeSpans_.end())
         {
-            nextList = nextSpan->next;
-            found = true;
-        }
-        else if (nextList) // 只有在链表非空时才遍历
-        {
-            Span* prev = nextList;
-            while (prev->next)
+            Span*& nextList = it->second;
+
+            // 检查nextSpan是否是链表头
+            if (nextList == nextSpan)
             {
-                if (prev->next == nextSpan)
-                {   
-                    // 将nextSpan从空闲链表中移除
-                    prev->next = nextSpan->next;
-                    found = true;
-                    break;
+                nextList = nextSpan->next;
+                found = true;
+            }
+            else
+            {
+                // 遍历链表查找nextSpan
+                Span* prev = nextList;
+                while (prev && prev->next)
+                {
+                    if (prev->next == nextSpan)
+                    {
+                        prev->next = nextSpan->next;
+                        found = true;
+                        break;
+                    }
+                    prev = prev->next;
                 }
-                prev = prev->next;
+            }
+
+            // 如果成功移除了 nextSpan，且该大小类链表已经为空
+            if (found && nextList == nullptr){
+                freeSpans_.erase(it);
             }
         }
+
 
         // 2. 只有在找到nextSpan的情况下才进行合并
         if (found)
@@ -115,12 +131,14 @@ void PageCache::deallocateSpan(void* ptr, size_t numPages)
             spanMap_.erase(nextAddr);
             delete nextSpan;
         }
+
     }
 
     // 将合并后的span通过头插法插入空闲列表
     auto& list = freeSpans_[span->numPages];
     span->next = list;
     list = span;
+    
 }
 
 void* PageCache::systemAlloc(size_t numPages)

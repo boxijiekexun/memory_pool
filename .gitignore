@@ -1,0 +1,11 @@
+# Build output
+/build/
+**/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Editor and language-server cache
+.cache/
+.vscode/c_cpp_properties.json

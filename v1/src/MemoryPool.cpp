@@ -42,7 +42,9 @@ void* MemoryPool::allocate()
     if (slot != nullptr)
         return slot;
 
-    Slot* temp;
+    Slot *temp;
+    // 额外添加的 {}，主要是为了控制 std::lock_guard 的生命周期，
+    // 从而缩小互斥锁（mutex）的加锁范围。
     {   
         std::lock_guard<std::mutex> lock(mutexForBlock_);
         if (curSlot_ >= lastSlot_)
@@ -59,6 +61,8 @@ void* MemoryPool::allocate()
     return temp; 
 }
 
+// 释放内存槽
+// 然后复用
 void MemoryPool::deallocate(void* ptr)
 {
     if (!ptr) return;
@@ -68,13 +72,20 @@ void MemoryPool::deallocate(void* ptr)
 }
 
 void MemoryPool::allocateNewBlock()
-{   
-    //std::cout << "申请一块内存块，SlotSize: " << SlotSize_ << std::endl;
-    // 头插法插入新的内存块
-    void* newBlock = operator new(BlockSize_);
+{
+    // std::cout << "申请一块内存块，SlotSize: " << SlotSize_ << std::endl;
+    //  头插法插入新的内存块
+    // 分配 4096 字节的原始内存
+    void *newBlock = operator new(BlockSize_);
+    // reinterpret_cast 将 newBlock 转换为 Slot* 类型，
+    // 并将其 next 指针指向当前的 firstBlock_，然后更新
+    // firstBlock_为新的内存块。 链表头插法
+    // newBlock -> next -> firstBlock_
     reinterpret_cast<Slot*>(newBlock)->next = firstBlock_;
     firstBlock_ = reinterpret_cast<Slot*>(newBlock);
 
+    // sizeof(Slot*) 是为了跳过内存块的头部，储存block 管理信息
+    // 确保 curSlot_ 指向实际可用的内存槽
     char* body = reinterpret_cast<char*>(newBlock) + sizeof(Slot*);
     size_t paddingSize = padPointer(body, SlotSize_); // 计算对齐需要填充内存的大小
     curSlot_ = reinterpret_cast<Slot*>(body + paddingSize);
@@ -91,17 +102,20 @@ size_t MemoryPool::padPointer(char* p, size_t align)
     return rem == 0 ? 0 : (align - rem);
 }
 
+// CAS（Compare-And-Swap，比较并交换）。
 // 实现无锁入队操作
 bool MemoryPool::pushFreeList(Slot* slot)
 {
     while (true)
     {
         // 获取当前头节点
+        // 这里使用 memory_order_relaxed 是因为我们只需要获取当前的头节点，并不关心其他线程对 freeList_ 的修改
         Slot* oldHead = freeList_.load(std::memory_order_relaxed);
         // 将新节点的 next 指向当前头节点
         slot->next.store(oldHead, std::memory_order_relaxed);
 
         // 尝试将新节点设置为头节点
+        // 如果 freeList_ 当前仍然等于 oldHead，就把它更新为 slot；否则报告失败
         if (freeList_.compare_exchange_weak(oldHead, slot,
          std::memory_order_release, std::memory_order_relaxed))
         {
@@ -145,7 +159,7 @@ Slot* MemoryPool::popFreeList()
     }
 }
 
-
+// function: initMemoryPool
 void HashBucket::initMemoryPool()
 {
     for (int i = 0; i < MEMORY_POOL_NUM; i++)

@@ -34,6 +34,7 @@ CentralCache::CentralCache()
     spanCount_.store(0, std::memory_order_relaxed);
 }
 
+// 从中心缓存获取一批内存块
 void* CentralCache::fetchRange(size_t index)
 {
     // 索引检查，当索引大于等于FREE_LIST_SIZE时，说明申请内存过大应直接向系统申请
@@ -47,17 +48,18 @@ void* CentralCache::fetchRange(size_t index)
     }
 
     void* result = nullptr;
-    try 
-    {
+    try {
         // 尝试从中心缓存获取内存块
         result = centralFreeList_[index].load(std::memory_order_relaxed);
 
         if (!result)
         {
             // 如果中心缓存为空，从页缓存获取新的内存块
+            // 计算 块 的大小
             size_t size = (index + 1) * ALIGNMENT;
             result = fetchFromPageCache(size);
 
+            // 如果从页缓存获取失败，返回nullptr
             if (!result)
             {
                 locks_[index].clear(std::memory_order_release);
@@ -68,31 +70,37 @@ void* CentralCache::fetchRange(size_t index)
             char* start = static_cast<char*>(result);
 
             // 计算实际分配的页数
+            // span_pages 默认申请page 的数量
             size_t numPages = (size <= SPAN_PAGES * PageCache::PAGE_SIZE) ? 
                              SPAN_PAGES : (size + PageCache::PAGE_SIZE - 1) / PageCache::PAGE_SIZE;
             // 使用实际页数计算块数
+            // span 总字节数 / 每个block 大小
             size_t blockNum = (numPages * PageCache::PAGE_SIZE) / size;
-            
-            if (blockNum > 1) 
-            {  // 确保至少有两个块才构建链表
+
+            if (blockNum > 1) {
+                // 确保至少有两个块才构建链表
+                // 将内存块串成链表，除了第一个块，其他块都放入中心缓存 
                 for (size_t i = 1; i < blockNum; ++i) 
                 {
                     void* current = start + (i - 1) * size;
                     void* next = start + i * size;
                     *reinterpret_cast<void**>(current) = next;
                 }
+                // 最后一个块的next指针置为nullptr
                 *reinterpret_cast<void**>(start + (blockNum - 1) * size) = nullptr;
                 
                 // 保存result的下一个节点
                 void* next = *reinterpret_cast<void**>(result);
-                // 将result与链表断开
+                // 将result与链表断开 这里是设置result的next指针为nullptr，避免ThreadCache误认为还有下一个块
+                // 因为 result 是返回给ThreadCache的第一个块，所以要将其next指针置为nullptr，避免ThreadCache误认为还有下一个块
                 *reinterpret_cast<void**>(result) = nullptr;
                 // 更新中心缓存
                 centralFreeList_[index].store(
                     next, 
                     std::memory_order_release
                 );
-                
+
+                // span 追踪器
                 // 使用无锁方式记录span信息
                 // 做记录是为了将中心缓存多余内存块归还给页缓存做准备。考虑点：
                 // 1.CentralCache 管理的是小块内存，这些内存可能不连续
@@ -137,14 +145,22 @@ void* CentralCache::fetchRange(size_t index)
     return result;
 }
 
+// 将一批内存块归还给中心缓存
+/*
+* 加锁：因为 CentralCache 是多个线程共享的，必须保护共享链表。
+* 接收链表：找到归还链表的尾节点，将它连接到 centralFreeList_[index]的原链表头部。
+* 更新回收信息：判断是否需要执行延迟回收（Delayed Return），
+* 进一步检查 Span 是否可以归还 PageCache。
+*/
 void CentralCache::returnRange(void* start, size_t size, size_t index)
 {
     if (!start || index >= FREE_LIST_SIZE) 
         return;
 
     size_t blockSize = (index + 1) * ALIGNMENT;
-    size_t blockCount = size / blockSize;    
+    size_t blockCount = size / blockSize;
 
+    // 自旋锁保护
     while (locks_[index].test_and_set(std::memory_order_acquire)) 
     {
         std::this_thread::yield();
@@ -155,14 +171,17 @@ void CentralCache::returnRange(void* start, size_t size, size_t index)
         // 1. 将归还的链表连接到中心缓存
         void* end = start;
         size_t count = 1;
+        // 循环遍历到最后一个结点
         while (*reinterpret_cast<void**>(end) != nullptr && count < blockCount) {
             end = *reinterpret_cast<void**>(end);
             count++;
         }
         void* current = centralFreeList_[index].load(std::memory_order_relaxed);
+        // end->next = current
         *reinterpret_cast<void**>(end) = current; // 头插法（将原有链表接在归还链表后边）
         centralFreeList_[index].store(start, std::memory_order_release);
-        
+
+        // 先累计归还事件，过一段时间或达到一定次数后，再集中尝试回收。
         // 2. 更新延迟计数
         size_t currentCount = delayCounts_[index].fetch_add(1, std::memory_order_relaxed) + 1;
         auto currentTime = std::chrono::steady_clock::now();

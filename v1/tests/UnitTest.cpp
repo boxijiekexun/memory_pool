@@ -98,6 +98,7 @@ void BenchmarkNew(size_t ntimes, size_t nworks, size_t rounds)
 
 int main()
 {
+	// 初始化内存池
     HashBucket::initMemoryPool(); // 使用内存池接口前一定要先调用该函数
 	BenchmarkMemoryPool(100, 1, 10); // 测试内存池
 	std::cout << "===========================================================================" << std::endl;
