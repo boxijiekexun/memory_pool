@@ -1,6 +1,7 @@
 #pragma once
 #include "ThreadCache.h"
 
+// 对外接口
 namespace Kama_memoryPool
 {
 

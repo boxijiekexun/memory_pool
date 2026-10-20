@@ -1,5 +1,6 @@
 #include "../include/ThreadCache.h"
 #include "../include/CentralCache.h"
+#include <cstdlib>
 
 namespace Kama_memoryPool
 {
@@ -15,9 +16,10 @@ void* ThreadCache::allocate(size_t size)
     if (size > MAX_BYTES)
     {
         // 大对象直接从系统分配
-        return malloc(size);
+        return std::malloc(size);
     }
 
+    // 根据大小计算对应的索引
     size_t index = SizeClass::getIndex(size);
     
     // 更新对应自由链表的长度计数
@@ -25,8 +27,8 @@ void* ThreadCache::allocate(size_t size)
     
     // 检查线程本地自由链表
     // 如果 freeList_[index] 不为空，表示该链表中有可用内存块
-    if (void* ptr = freeList_[index])
-    {
+    if (void *ptr = freeList_[index]) {
+        // 单向链表的头删法
         freeList_[index] = *reinterpret_cast<void**>(ptr); // 将freeList_[index]指向的内存块的下一个内存块地址（取决于内存块的实现）
         return ptr;
     }
@@ -35,11 +37,15 @@ void* ThreadCache::allocate(size_t size)
     return fetchFromCentralCache(index);
 }
 
-void ThreadCache::deallocate(void* ptr, size_t size)
-{
+// 释放内存
+// size 是用户申请的大小，可能不是对齐后的大小
+// *ptr 是用户申请的内存块的起始地址
+void ThreadCache::deallocate(void *ptr, size_t size) {
+    // size > MAX_BYTES 的情况直接释放内存
+    // 因为是直接从系统分配的内存，所以直接释放即可
     if (size > MAX_BYTES)
     {
-        free(ptr);
+        std::free(ptr);
         return;
     }
 
@@ -50,9 +56,10 @@ void ThreadCache::deallocate(void* ptr, size_t size)
     freeList_[index] = ptr;
 
     // 更新对应自由链表的长度计数
-    freeListSize_[index]++; 
+    freeListSize_[index]++;
 
     // 判断是否需要将部分内存回收给中心缓存
+    // 提高后续缓存的命中率，避免线程本地缓存过大
     if (shouldReturnToCentralCache(index))
     {
         returnToCentralCache(freeList_[index], size);
@@ -114,8 +121,8 @@ void ThreadCache::returnToCentralCache(void* start, size_t size)
     char* current = static_cast<char*>(start);
     // 使用对齐后的大小计算分割点
     char* splitNode = current;
-    for (size_t i = 0; i < keepNum - 1; ++i) 
-    {
+    for (size_t i = 0; i < keepNum - 1; ++i) {
+        // 链表头插法
         splitNode = reinterpret_cast<char*>(*reinterpret_cast<void**>(splitNode));
         if (splitNode == nullptr) 
         {

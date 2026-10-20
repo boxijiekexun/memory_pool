@@ -6,14 +6,15 @@
 #include <atomic>
 #include <chrono>
 
+// 所有线程共享的缓存
 namespace Kama_memoryPool
 {
 
 // 使用无锁的span信息存储
 struct SpanTracker {
-    std::atomic<void*> spanAddr{nullptr};
-    std::atomic<size_t> numPages{0};
-    std::atomic<size_t> blockCount{0};
+    std::atomic<void*> spanAddr{nullptr}; // span的起始地址
+    std::atomic<size_t> numPages{0}; // span的页数
+    std::atomic<size_t> blockCount{0}; // span中总共分配了多少块内存
     std::atomic<size_t> freeCount{0}; // 用于追踪spn中还有多少块是空闲的，如果所有块都空闲，则归还span给PageCache
 };
 
