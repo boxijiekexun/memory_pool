@@ -1,13 +1,5 @@
 # Kama-memoryPool 内存池
 
-> **本项目目前只在[知识星球](https://programmercarl.com/other/kstar.html)答疑并维护**。
-
-
-这次[知识星球](https://programmercarl.com/other/kstar.html)里再添一个C++轮子项目：内存池
-
-代码量不到1000行，又是一个完整的项目。
-
-内存池在实际的项目开发中较为常见，这次从学习的角度带大家去高效了解和学习内存池项目。
 
 ## 什么是内存池？
 
@@ -73,47 +65,5 @@
 * 复杂性：实现和调试内存池代码比直接使用 malloc / new 更复杂。
 * 不适合大型对象：对于大对象的分配可能并不划算。
 
-## 内存池项目精讲
 
-
-该项目的专栏是[知识星球](https://programmercarl.com/other/kstar.html)录友专享的。
-
-项目专栏依然是将 「简历写法」给大家列出来了，大家学完就可以参考这个来写简历：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250224100020.png' width=500 alt=''></img></div>
-
-做完该项目，面试中大概率会有哪些面试问题，以及如何回答，也列出好了：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250224100104.png' width=500 alt=''></img></div>
-
-专栏中的项目面试题都掌握的话，这个项目在面试中基本没问题。
-
-当然项目专栏会对本项目代码做详细的讲解：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250224100151.png' width=500 alt=''></img></div>
-
-分三个版本去讲解：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250224100226.png' width=500 alt=''></img></div>
-
-每个版本给大家换架构图：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250224100315.png' width=500 alt=''></img></div>
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250224100341.png' width=500 alt=''></img></div>
-
-同时还会对项目做测试：
-
-<div align="center"><img src='https://file1.kamacoder.com/i/algo/20250224100433.png' width=500 alt=''></img></div>
-
-## 答疑
-
-本项目在[知识星球](https://programmercarl.com/other/kstar.html)里为 文字专栏形式，大家不用担心，看不懂，星球里每个项目有专属答疑群，任何问题都可以在群里问，都会得到解答：
-
-![](https://file1.kamacoder.com/i/web/2025-09-26_11-30-13.jpg)
-
-
-## 获取本项目专栏
-
-**本文档仅为星球内部专享，大家可以加入[知识星球](./kstar.md)里获取，在星球置顶一**
 
