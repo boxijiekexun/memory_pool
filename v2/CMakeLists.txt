@@ -29,14 +29,29 @@ add_executable(unit_test
 )
 
 # 创建性能测试可执行文件
-add_executable(perf_test
+add_executable(perf_test 
     ${SOURCES}
     ${TEST_DIR}/PerformanceTest.cpp
 )
 
+# Focused regression reproducer for PageCache's empty free-list bucket bug.
+add_executable(page_cache_empty_free_list_test
+    ${SOURCES}
+    ${TEST_DIR}/PageCacheEmptyFreeListTest.cpp
+)
+
+# PageCache 回归测试
+add_executable(pagecache_test
+    ${SRC_DIR}/PageCache.cpp
+    ${TEST_DIR}/PageCacheSpanTest.cpp
+)
+
+
 # 链接pthread库
 target_link_libraries(unit_test PRIVATE Threads::Threads)
 target_link_libraries(perf_test PRIVATE Threads::Threads)
+target_link_libraries(page_cache_empty_free_list_test PRIVATE Threads::Threads)
+target_link_libraries(pagecache_test PRIVATE Threads::Threads)
 
 # 添加测试命令
 add_custom_target(test
