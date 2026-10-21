@@ -34,10 +34,34 @@ add_executable(perf_test
     ${TEST_DIR}/PerformanceTest.cpp
 )
 
-# Focused regression reproducer for PageCache's empty free-list bucket bug.
+# PageCache 空闲链表桶回归测试
 add_executable(page_cache_empty_free_list_test
-    ${SOURCES}
+    ${SRC_DIR}/PageCache.cpp
     ${TEST_DIR}/PageCacheEmptyFreeListTest.cpp
+)
+
+# PageCache 分割 Span 映射登记回归测试
+add_executable(page_cache_span_mapping_test
+    ${SRC_DIR}/PageCache.cpp
+    ${TEST_DIR}/SpanMappingTest.cpp
+)
+
+# PageCache 相邻 Span 合并回归测试
+add_executable(page_cache_span_coalescing_test
+    ${SRC_DIR}/PageCache.cpp
+    ${TEST_DIR}/SpanCoalescingTest.cpp
+)
+
+# PageCache 重复释放回归测试
+add_executable(page_cache_double_free_test
+    ${SRC_DIR}/PageCache.cpp
+    ${TEST_DIR}/PageCacheDoubleFreeTest.cpp
+)
+
+# PageCache 双向 Span 合并回归测试
+add_executable(page_cache_bidirectional_coalescing_test
+    ${SRC_DIR}/PageCache.cpp
+    ${TEST_DIR}/PageCacheBidirectionalCoalescingTest.cpp
 )
 
 # PageCache 回归测试
@@ -51,6 +75,10 @@ add_executable(pagecache_test
 target_link_libraries(unit_test PRIVATE Threads::Threads)
 target_link_libraries(perf_test PRIVATE Threads::Threads)
 target_link_libraries(page_cache_empty_free_list_test PRIVATE Threads::Threads)
+target_link_libraries(page_cache_span_mapping_test PRIVATE Threads::Threads)
+target_link_libraries(page_cache_span_coalescing_test PRIVATE Threads::Threads)
+target_link_libraries(page_cache_double_free_test PRIVATE Threads::Threads)
+target_link_libraries(page_cache_bidirectional_coalescing_test PRIVATE Threads::Threads)
 target_link_libraries(pagecache_test PRIVATE Threads::Threads)
 
 # 添加测试命令

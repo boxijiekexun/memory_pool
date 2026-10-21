@@ -27,6 +27,8 @@ void* PageCache::allocateSpan(size_t numPages)
         {
             freeSpans_.erase(it);
         }
+        // 已从空闲链表摘除，当前正在分配。
+        span->isFree = false;
 
         // 如果span大于需要的numPages则进行分割
         if (span->numPages > numPages) 
@@ -36,6 +38,7 @@ void* PageCache::allocateSpan(size_t numPages)
                                 numPages * PAGE_SIZE;
             newSpan->numPages = span->numPages - numPages;
             newSpan->next = nullptr;
+            newSpan->isFree = true;
 
             // 将超出部分放回空闲Span*列表头部
             auto& list = freeSpans_[newSpan->numPages];
@@ -78,66 +81,62 @@ void PageCache::deallocateSpan(void* ptr, size_t numPages)
 
     Span* span = it->second;
 
-    // 尝试合并相邻的span
-    void* nextAddr = static_cast<char*>(ptr) + numPages * PAGE_SIZE;
-    auto nextIt = spanMap_.find(nextAddr);
-    
-    if (nextIt != spanMap_.end())
-    {
-        Span* nextSpan = nextIt->second;
-        
-        // 1. 首先检查nextSpan是否在空闲链表中
-        bool found = false;
-        // auto& nextList = freeSpans_[nextSpan->numPages];
-        auto it = freeSpans_.find(nextSpan->numPages);
-        if (it != freeSpans_.end())
-        {
-            Span*& nextList = it->second;
+    // 阻止同一 Span 被重复归还并重复插入空闲链表。
+    if (span->isFree) return;
 
-            // 检查nextSpan是否是链表头
-            if (nextList == nextSpan)
-            {
-                nextList = nextSpan->next;
-                found = true;
-            }
-            else
-            {
-                // 遍历链表查找nextSpan
-                Span* prev = nextList;
-                while (prev && prev->next)
-                {
-                    if (prev->next == nextSpan)
-                    {
-                        prev->next = nextSpan->next;
-                        found = true;
-                        break;
-                    }
-                    prev = prev->next;
-                }
-            }
+    // 从对应大小的空闲链表中摘除一个 Span。
+    auto removeFreeSpan = [this](Span* target) {
+        auto bucket = freeSpans_.find(target->numPages);
+        if (bucket == freeSpans_.end()) return false;
 
-            // 如果成功移除了 nextSpan，且该大小类链表已经为空
-            if (found && nextList == nullptr){
-                freeSpans_.erase(it);
-            }
+        Span*& head = bucket->second;
+        if (head == target) {
+            head = target->next;
+        } else {
+            Span* prev = head;
+            while (prev && prev->next != target) prev = prev->next;
+            if (!prev) return false;
+            prev->next = target->next;
         }
 
+        if (!head) freeSpans_.erase(bucket);
+        target->isFree = false;
+        target->next = nullptr;
+        return true;
+    };
 
-        // 2. 只有在找到nextSpan的情况下才进行合并
-        if (found)
-        {
-            // 合并span
+    // 先查有序地址映射中的前驱。只有前驱的末尾恰好等于当前起始地址时才相邻。
+    auto currentIt = spanMap_.find(ptr);
+    if (currentIt != spanMap_.begin()) {
+        auto prevIt = currentIt;
+        --prevIt;
+        Span* prevSpan = prevIt->second;
+        void* prevEnd = static_cast<char*>(prevSpan->pageAddr) + prevSpan->numPages * PAGE_SIZE;
+        if (prevEnd == ptr && prevSpan->isFree && removeFreeSpan(prevSpan)) {
+            prevSpan->numPages += span->numPages;
+            spanMap_.erase(currentIt);
+            delete span;
+            span = prevSpan;
+        }
+    }
+
+    // 检查合并后 Span 右侧的相邻 Span。使用元数据中的实际页数计算边界。
+    void* nextAddr = static_cast<char*>(span->pageAddr) + span->numPages * PAGE_SIZE;
+    auto nextIt = spanMap_.find(nextAddr);
+    if (nextIt != spanMap_.end()) {
+        Span* nextSpan = nextIt->second;
+        if (nextSpan->isFree && removeFreeSpan(nextSpan)) {
             span->numPages += nextSpan->numPages;
-            spanMap_.erase(nextAddr);
+            spanMap_.erase(nextIt);
             delete nextSpan;
         }
-
     }
 
     // 将合并后的span通过头插法插入空闲列表
     auto& list = freeSpans_[span->numPages];
     span->next = list;
     list = span;
+    span->isFree = true;
     
 }
 

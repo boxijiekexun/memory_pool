@@ -1,70 +1,109 @@
 /*
- * 测试思路：
- * 1. 申请 8 页 Span 并归还，使 PageCache 中有一个 8 页空闲 Span。
- * 2. 申请 6 页，触发分割，剩余的 2 页 Span 放入 2 页空闲链表。
- * 3. 再申请 2 页，取走剩余 Span；此时 6 页和 2 页 Span 都在使用。
- * 4. 仅归还 6 页 Span。释放逻辑检查右侧 2 页 Span 时，会通过
- *    freeSpans_[2] 取得空链表头，并可能在 map 中留下一个空链表项。
- * 5. 再申请 2 页，检查是否因取到空链表项而解引用空指针。
- *
- * 当前测试在子进程中执行上述步骤，父进程检查子进程是否因最后一次
- * 申请触发 SIGSEGV，避免崩溃终止整个测试进程。
+ * 回归测试 PageCache 的空闲链表桶处理：
+ * 先申请 8 页并归还，再分割为 6 页和 2 页；保持右侧 2 页 Span 在用，
+ * 归还左侧 6 页后再次申请 2 页。测试要求子进程正常退出，且新分配
+ * 有效并且不与仍在使用的右侧 Span 重叠。
  */
 #include "../include/PageCache.h"
 
-#include <cassert>
-#include <csignal>
+#include <cstdint>
 #include <iostream>
 #include <sys/wait.h>
 #include <unistd.h>
 
 using namespace Kama_memoryPool;
 
+namespace {
 
-// Bug reproducer:
-// Success means the child crashed with SIGSEGV.
-// This is NOT yet a regression test.
+bool rangesOverlap(const void* first, size_t firstSize,
+                   const void* second, size_t secondSize)
+{
+    const auto firstBegin = reinterpret_cast<uintptr_t>(first);
+    const auto secondBegin = reinterpret_cast<uintptr_t>(second);
+    return firstBegin < secondBegin + secondSize &&
+           secondBegin < firstBegin + firstSize;
+}
 
+int runTest()
+{
+    PageCache& pageCache = PageCache::getInstance();
 
-
-int main() {
-    // 在子进程中运行测试，以便在发生段错误时不会终止整个测试套件
-    const pid_t child = fork();
-    assert(child >= 0);
-
-    if (child == 0)
-    {
-        PageCache& pageCache = PageCache::getInstance();
-
-        void* eightPages = pageCache.allocateSpan(8);
-        assert(eightPages != nullptr);
-        pageCache.deallocateSpan(eightPages, 8);
-
-        void* sixPages = pageCache.allocateSpan(6);
-        assert(sixPages == eightPages);
-
-        void* twoPages = pageCache.allocateSpan(2);
-        assert(twoPages == static_cast<char*>(sixPages) + 6 * PageCache::PAGE_SIZE);
-
-        // 右侧 2 页 Span 仍在使用；释放 6 页 Span 时会检查这个相邻位置。
-        pageCache.deallocateSpan(sixPages, 6);
-
-        // 若空链表项仍存在，lower_bound(2) 会取到空的 Span* 链表头并解引用。
-        (void)pageCache.allocateSpan(2);
-        _exit(0);
+    void* eightPages = pageCache.allocateSpan(8);
+    if (eightPages == nullptr) {
+        std::cerr << "FAIL: could not allocate the initial 8-page span.\n";
+        return 1;
     }
+    pageCache.deallocateSpan(eightPages, 8);
 
-    int status = 0;
-    assert(waitpid(child, &status, 0) == child);
-
-    // 当前测试用于复现问题：只有子进程在最后一次申请时收到 SIGSEGV 才算通过。
-    // 实现修复后，应改为检查子进程正常退出且最后一次申请成功。
-    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGSEGV)
-    {
-        std::cerr << "预期空链表场景下 allocateSpan(2) 触发 SIGSEGV\n";
+    void* sixPages = pageCache.allocateSpan(6);
+    if (sixPages == nullptr) {
+        std::cerr << "FAIL: could not allocate the 6-page span.\n";
+        return 1;
+    }
+    if (sixPages != eightPages) {
+        std::cerr << "FAIL: the 6-page allocation did not reuse the 8-page span.\n";
         return 1;
     }
 
-    std::cout << "已复现空闲链表头空指针解引用（SIGSEGV）。\n";
+    void* twoPages = pageCache.allocateSpan(2);
+    if (twoPages == nullptr) {
+        std::cerr << "FAIL: could not allocate the remaining 2-page span.\n";
+        return 1;
+    }
+    if (twoPages != static_cast<char*>(sixPages) + 6 * PageCache::PAGE_SIZE) {
+        std::cerr << "FAIL: the 2-page allocation is not the expected right-hand span.\n";
+        return 1;
+    }
+
+    // 保持 twoPages 在用；归还左侧 Span 时会检查右邻地址。
+    pageCache.deallocateSpan(sixPages, 6);
+
+    void* result = pageCache.allocateSpan(2);
+    if (result == nullptr) {
+        std::cerr << "FAIL: allocation after releasing the 6-page span returned null.\n";
+        return 1;
+    }
+
+    const size_t twoPageBytes = 2 * PageCache::PAGE_SIZE;
+    if (rangesOverlap(result, twoPageBytes, twoPages, twoPageBytes)) {
+        std::cerr << "FAIL: the new allocation overlaps the still-in-use 2-page span.\n";
+        return 1;
+    }
+
+    std::cout << "PASS: allocation returned valid memory without overlapping the live span.\n";
+    return 0;
+}
+
+} // namespace
+
+int main()
+{
+    const pid_t child = fork();
+    if (child < 0) {
+        std::cerr << "FAIL: fork failed.\n";
+        return 1;
+    }
+
+    if (child == 0) {
+        return runTest();
+    }
+
+    int status = 0;
+    const pid_t waited = waitpid(child, &status, 0);
+    if (waited != child) {
+        std::cerr << "FAIL: waitpid failed.\n";
+        return 1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (WIFSIGNALED(status)) {
+            std::cerr << "FAIL: child terminated by signal "
+                      << WTERMSIG(status) << ".\n";
+        } else {
+            std::cerr << "FAIL: child did not exit successfully.\n";
+        }
+        return 1;
+    }
+
+    std::cout << "PageCache empty free-list test passed.\n";
     return 0;
 }
