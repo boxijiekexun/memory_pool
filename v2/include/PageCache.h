@@ -34,6 +34,7 @@ private:
         void*  pageAddr; // 页起始地址
         size_t numPages; // 页数
         Span*  next;     // 链表指针
+        bool isFree = false; // 是否位于 freeSpans_ 中
     };
 
     // 按页数管理空闲span，不同页数对应不同Span链表
