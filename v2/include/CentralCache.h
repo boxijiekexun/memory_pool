@@ -1,21 +1,19 @@
 #pragma once
 #include "Common.h"
-#include <mutex>
-#include <unordered_map>
 #include <array>
 #include <atomic>
-#include <chrono>
+#include <vector>
 
 // 所有线程共享的缓存
 namespace Kama_memoryPool
 {
 
-// 使用无锁的span信息存储
 struct SpanTracker {
-    std::atomic<void*> spanAddr{nullptr}; // span的起始地址
-    std::atomic<size_t> numPages{0}; // span的页数
-    std::atomic<size_t> blockCount{0}; // span中总共分配了多少块内存
-    std::atomic<size_t> freeCount{0}; // 用于追踪spn中还有多少块是空闲的，如果所有块都空闲，则归还span给PageCache
+    void* spanAddr = nullptr;
+    size_t numPages = 0;
+    size_t blockCount = 0;
+    // 只统计当前位于 CentralCache 空闲链表中的块。
+    size_t freeCount = 0;
 };
 
 class CentralCache
@@ -36,11 +34,11 @@ private:
     // 从页缓存获取内存
     void* fetchFromPageCache(size_t size);
 
-    // 获取span信息
-    SpanTracker* getSpanTracker(void* blockAddr);
+    // 在对应大小类的锁保护下，查找包含块地址的 Span。
+    SpanTracker* getSpanTracker(size_t index, void* blockAddr);
 
-    // 更新span的空闲计数并检查是否可以归还
-    void updateSpanFreeCount(SpanTracker* tracker, size_t newFreeBlocks, size_t index);
+    // 更新精确的中央空闲块计数；全空闲时从链表移除并归还 PageCache。
+    void updateSpanFreeCount(size_t index, SpanTracker* tracker, size_t returnedBlocks);
 
 private:
     // 中心缓存的自由链表
@@ -49,18 +47,8 @@ private:
     // 用于同步的自旋锁
     std::array<std::atomic_flag, FREE_LIST_SIZE> locks_;
     
-    // 使用数组存储span信息，避免map的开销
-    std::array<SpanTracker, 1024> spanTrackers_;
-    std::atomic<size_t> spanCount_{0};
-
-    // 延迟归还相关的成员变量
-    static const size_t MAX_DELAY_COUNT = 48;  // 最大延迟计数
-    std::array<std::atomic<size_t>, FREE_LIST_SIZE> delayCounts_;  // 每个大小类的延迟计数
-    std::array<std::chrono::steady_clock::time_point, FREE_LIST_SIZE> lastReturnTimes_;  // 上次归还时间
-    static const std::chrono::milliseconds DELAY_INTERVAL;  // 延迟间隔
-
-    bool shouldPerformDelayedReturn(size_t index, size_t currentCount, std::chrono::steady_clock::time_point currentTime);
-    void performDelayedReturn(size_t index);
+    // 一个大小类锁同时保护该类链表及其 Span 元数据。
+    std::array<std::vector<SpanTracker>, FREE_LIST_SIZE> spanTrackers_;
 };
 
 } // namespace memoryPool
