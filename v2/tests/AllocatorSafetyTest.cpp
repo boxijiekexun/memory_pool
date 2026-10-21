@@ -15,29 +15,50 @@ namespace {
 int testSpanReclaimPreservesOtherSpans()
 {
     auto& central = CentralCache::getInstance();
-    const size_t blockSize = 16 * 1024;
+    const size_t blockSize = ALIGNMENT;
     const size_t index = SizeClass::getIndex(blockSize);
+    const size_t blocksPerSpan = 8 * PageCache::PAGE_SIZE / blockSize;
+    std::vector<void*> firstSpanBlocks;
+    firstSpanBlocks.reserve(blocksPerSpan);
 
-    void* a0 = central.fetchRange(index);
-    void* a1 = central.fetchRange(index);
-    void* b0 = central.fetchRange(index);
-    if (!a0 || !a1 || !b0) return 1;
+    // Exhaust one Span in batches so the next fetch creates a second Span.
+    while (firstSpanBlocks.size() < blocksPerSpan) {
+        void* batch = central.fetchRange(index);
+        if (!batch) return 1;
+        for (void* current = batch; current; current = *reinterpret_cast<void**>(current))
+            firstSpanBlocks.push_back(current);
+    }
+    if (firstSpanBlocks.size() != blocksPerSpan) return 1;
 
-    void* expectedB1 = static_cast<char*>(b0) + blockSize;
-    *reinterpret_cast<void**>(a0) = a1;
-    *reinterpret_cast<void**>(a1) = nullptr;
-    central.returnRange(a0, 2 * blockSize, index);
+    void* secondSpanBatch = central.fetchRange(index);
+    if (!secondSpanBatch) return 1;
+    const void* expectedSecondSpanRemainder =
+        static_cast<char*>(secondSpanBatch) + CentralCache::BATCH_SIZE * blockSize;
 
-    // A Span 的完整回收不能丢掉中央链表头部属于 B Span 的空闲块。
-    void* b1 = central.fetchRange(index);
-    if (b1 != expectedB1) {
+    for (size_t i = 0; i < firstSpanBlocks.size(); ++i) {
+        *reinterpret_cast<void**>(firstSpanBlocks[i]) =
+            i + 1 < firstSpanBlocks.size() ? firstSpanBlocks[i + 1] : nullptr;
+    }
+    central.returnRange(firstSpanBlocks.front(), firstSpanBlocks.size() * blockSize, index);
+
+    // 回收第一个 Span 后，第二个 Span 的中央链表节点仍应可取到。
+    void* secondSpanNextBatch = central.fetchRange(index);
+    if (secondSpanNextBatch != expectedSecondSpanRemainder) {
         std::cerr << "reclaiming one span lost another span's central free block\n";
         return 1;
     }
 
-    *reinterpret_cast<void**>(b0) = b1;
-    *reinterpret_cast<void**>(b1) = nullptr;
-    central.returnRange(b0, 2 * blockSize, index);
+    // 归还第二个 Span 已分配给测试的两个批次，覆盖跨 Span 批量传输。
+    void* secondSpanTail = secondSpanBatch;
+    while (*reinterpret_cast<void**>(secondSpanTail))
+        secondSpanTail = *reinterpret_cast<void**>(secondSpanTail);
+    *reinterpret_cast<void**>(secondSpanTail) = secondSpanNextBatch;
+    size_t secondBatchCount = 0;
+    for (void* current = secondSpanNextBatch; current;
+         current = *reinterpret_cast<void**>(current))
+        ++secondBatchCount;
+    central.returnRange(secondSpanBatch,
+                        (CentralCache::BATCH_SIZE + secondBatchCount) * blockSize, index);
     return 0;
 }
 
@@ -50,13 +71,18 @@ int testTrackerCapacityAndRetirement()
     std::vector<void*> blocks;
     blocks.reserve(spanCount * 2);
 
-    for (size_t i = 0; i < spanCount * 2; ++i) {
+    for (size_t i = 0; i < spanCount; ++i) {
         void* block = central.fetchRange(index);
         if (!block) {
             std::cerr << "failed while creating more than 1024 tracked spans\n";
             return 1;
         }
-        blocks.push_back(block);
+        size_t batchCount = 0;
+        for (void* current = block; current; current = *reinterpret_cast<void**>(current)) {
+            blocks.push_back(current);
+            ++batchCount;
+        }
+        if (batchCount != 2) return 1;
     }
 
     for (size_t i = 0; i < blocks.size(); ++i) {
@@ -68,8 +94,10 @@ int testTrackerCapacityAndRetirement()
     // 所有追踪记录均应退休；同一大小类仍可重新申请和归还。
     void* block = central.fetchRange(index);
     if (!block) return 1;
-    *reinterpret_cast<void**>(block) = nullptr;
-    central.returnRange(block, blockSize, index);
+    size_t batchCount = 0;
+    for (void* current = block; current; current = *reinterpret_cast<void**>(current))
+        ++batchCount;
+    central.returnRange(block, batchCount * blockSize, index);
     return 0;
 }
 

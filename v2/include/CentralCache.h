@@ -19,10 +19,13 @@ struct SpanTracker {
 class CentralCache
 {
 public:
+    static constexpr size_t BATCH_SIZE = 32;
+
     static CentralCache& getInstance()
     {
-        static CentralCache instance;
-        return instance;
+        // ThreadCache TLS 析构期间仍可能调用 CentralCache。
+        static CentralCache* instance = new CentralCache;
+        return *instance;
     }
 
     void* fetchRange(size_t index);
@@ -37,8 +40,8 @@ private:
     // 在对应大小类的锁保护下，查找包含块地址的 Span。
     SpanTracker* getSpanTracker(size_t index, void* blockAddr);
 
-    // 更新精确的中央空闲块计数；全空闲时从链表移除并归还 PageCache。
-    void updateSpanFreeCount(size_t index, SpanTracker* tracker, size_t returnedBlocks);
+    // 归还一个已完全空闲的 Span，并退休其追踪记录。
+    void releaseSpan(size_t index, size_t trackerIndex);
 
 private:
     // 中心缓存的自由链表

@@ -13,8 +13,9 @@ public:
 
     static PageCache& getInstance()
     {
-        static PageCache instance;
-        return instance;
+        // 缓存需在 ThreadCache TLS 析构期间保持可用。
+        static PageCache* instance = new PageCache;
+        return *instance;
     }
 
     // 分配指定页数的span

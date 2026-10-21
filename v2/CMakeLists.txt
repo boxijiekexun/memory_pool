@@ -46,12 +46,6 @@ add_executable(page_cache_span_mapping_test
     ${TEST_DIR}/SpanMappingTest.cpp
 )
 
-# PageCache 相邻 Span 合并回归测试
-add_executable(page_cache_span_coalescing_test
-    ${SRC_DIR}/PageCache.cpp
-    ${TEST_DIR}/SpanCoalescingTest.cpp
-)
-
 # PageCache 重复释放回归测试
 add_executable(page_cache_double_free_test
     ${SRC_DIR}/PageCache.cpp
@@ -70,28 +64,48 @@ add_executable(allocator_safety_test
     ${TEST_DIR}/AllocatorSafetyTest.cpp
 )
 
-# PageCache 回归测试
-add_executable(pagecache_test
-    ${SRC_DIR}/PageCache.cpp
-    ${TEST_DIR}/PageCacheSpanTest.cpp
+# 零字节请求批量归还回归测试
+add_executable(zero_size_batch_return_test
+    ${SOURCES}
+    ${TEST_DIR}/ZeroSizeBatchReturnTest.cpp
 )
 
+# ThreadCache TLS 析构归还回归测试
+add_executable(thread_cache_exit_test
+    ${SOURCES}
+    ${TEST_DIR}/ThreadCacheExitTest.cpp
+)
 
 # 链接pthread库
 target_link_libraries(unit_test PRIVATE Threads::Threads)
 target_link_libraries(perf_test PRIVATE Threads::Threads)
 target_link_libraries(page_cache_empty_free_list_test PRIVATE Threads::Threads)
 target_link_libraries(page_cache_span_mapping_test PRIVATE Threads::Threads)
-target_link_libraries(page_cache_span_coalescing_test PRIVATE Threads::Threads)
 target_link_libraries(page_cache_double_free_test PRIVATE Threads::Threads)
 target_link_libraries(page_cache_bidirectional_coalescing_test PRIVATE Threads::Threads)
 target_link_libraries(allocator_safety_test PRIVATE Threads::Threads)
-target_link_libraries(pagecache_test PRIVATE Threads::Threads)
+target_link_libraries(zero_size_batch_return_test PRIVATE Threads::Threads)
+target_link_libraries(thread_cache_exit_test PRIVATE Threads::Threads)
 
 # 添加测试命令
 add_custom_target(test
     COMMAND ./unit_test
-    DEPENDS unit_test
+    COMMAND ./page_cache_empty_free_list_test
+    COMMAND ./page_cache_span_mapping_test
+    COMMAND ./page_cache_double_free_test
+    COMMAND ./page_cache_bidirectional_coalescing_test
+    COMMAND ./allocator_safety_test
+    COMMAND ./zero_size_batch_return_test
+    COMMAND ./thread_cache_exit_test
+    DEPENDS
+        unit_test
+        page_cache_empty_free_list_test
+        page_cache_span_mapping_test
+        page_cache_double_free_test
+        page_cache_bidirectional_coalescing_test
+        allocator_safety_test
+        zero_size_batch_return_test
+        thread_cache_exit_test
 )
 
 add_custom_target(perf

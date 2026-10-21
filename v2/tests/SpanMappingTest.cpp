@@ -22,6 +22,7 @@ int runTest()
         std::cerr << "FAIL: allocateSpan(8) returned null initially.\n";
         return 1;
     }
+    // 把原始 Span 放回缓存，后续 6 页申请应从它切分。
     pc.deallocateSpan(p, 8);
 
     void* a = pc.allocateSpan(6);
@@ -37,6 +38,7 @@ int runTest()
     // 故意不申请剩余的 2 页：该尾部 Span 必须已在 spanMap_ 登记。
     pc.deallocateSpan(a, 6);
 
+    // 完整 8 页请求只能通过识别并合并尾部空闲 Span 来满足。
     void* result = pc.allocateSpan(8);
     if (result == nullptr) {
         std::cerr << "FAIL: allocateSpan(8) returned null after coalescing.\n";
@@ -55,6 +57,7 @@ int runTest()
 
 int main()
 {
+    // 在独立子进程中使用 PageCache 单例，避免状态影响其他测试。
     const pid_t child = fork();
     if (child < 0) {
         std::cerr << "FAIL: fork failed.\n";

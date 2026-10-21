@@ -18,6 +18,7 @@ namespace {
 bool rangesOverlap(const void* first, size_t firstSize,
                    const void* second, size_t secondSize)
 {
+    // 将半开地址区间转为整数比较，避免对无关内存块指针做大小比较。
     const auto firstBegin = reinterpret_cast<uintptr_t>(first);
     const auto secondBegin = reinterpret_cast<uintptr_t>(second);
     return firstBegin < secondBegin + secondSize &&
@@ -33,6 +34,7 @@ int runTest()
         std::cerr << "FAIL: could not allocate the initial 8-page span.\n";
         return 1;
     }
+    // 建立一个可供后续切分复用的 8 页空闲 Span。
     pageCache.deallocateSpan(eightPages, 8);
 
     void* sixPages = pageCache.allocateSpan(6);
@@ -64,6 +66,7 @@ int runTest()
         return 1;
     }
 
+    // 检查完整的 2 页地址范围，确保新分配没有覆盖仍在使用的邻接 Span。
     const size_t twoPageBytes = 2 * PageCache::PAGE_SIZE;
     if (rangesOverlap(result, twoPageBytes, twoPages, twoPageBytes)) {
         std::cerr << "FAIL: the new allocation overlaps the still-in-use 2-page span.\n";
@@ -78,6 +81,7 @@ int runTest()
 
 int main()
 {
+    // 子进程独立运行场景，父进程可以检查其正常退出状态。
     const pid_t child = fork();
     if (child < 0) {
         std::cerr << "FAIL: fork failed.\n";

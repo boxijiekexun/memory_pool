@@ -28,6 +28,7 @@ public:
     // 将字节数向上取整到最近的对齐大小
     static size_t roundUp(size_t bytes)
     {
+        bytes = std::max(bytes, ALIGNMENT);
         return (bytes + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
     }
 
