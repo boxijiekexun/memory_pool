@@ -1,640 +1,223 @@
-# Kama Memory Pool v2：架构与实现原理
+# Memory Pool v2：设计与实现
 
-## 1. 项目概述
+v2 是在v1基础上重构的内存池实现。
+为什么会产生这个想法呢？
+主要是v1在多线程环境下存在一些问题，v2的目标是解决这些问题并提供更好的性能和可维护性。
 
-Kama Memory Pool v2 是一个使用 C++17 实现的多线程内存池（Memory Pool）项目。
+v2 通过三重缓存结构（ThreadCache、CentralCache、PageCache）来管理内存分配和释放。每个线程拥有自己的 ThreadCache，减少了锁的竞争；CentralCache 作为共享缓存，协调不同线程之间的内存使用；PageCache 管理实际的内存页和 Span。
 
-它的目标是：
-
-**提高程序频繁分配和释放小块内存时的效率，尤其是减少多线程之间的锁竞争。**
-
-例如，程序可能频繁执行：
+对外入口位于 [`include/MemoryPool.h`](include/MemoryPool.h)：
 
 ```cpp
-void* p = MemoryPool::allocate(32);
+#include "MemoryPool.h"
 
-// 使用内存
-
-MemoryPool::deallocate(p, 32);
+void* p = Kama_memoryPool::MemoryPool::allocate(25);
+// 使用 p
+Kama_memoryPool::MemoryPool::deallocate(p, 25);
 ```
 
-每次都交给通用内存分配器处理，可能带来额外的分配管理开销。
+释放时需要传入与分配时相同的请求大小，以便定位大小类。`allocate(0)` 按至少一个 `ALIGNMENT` 单位处理；`deallocate(nullptr, size)` 不做操作。
 
-因此，v2 尝试通过提前获取内存、缓存空闲块以及分层管理的方式减少这些开销。
-
-注意：通用的 `malloc/free` 本身也有优化和缓存。自定义内存池不一定更快，需要通过性能测试验证。
-
----
-
-## 2. 从 v1 到 v2：为什么需要重新设计？
-
-### 2.1 v1 的设计
-
-你之前学习的 v1，可以简化成：
+## 整体架构
 
 ```text
-用户申请内存
-     │
-     ▼
-  HashBucket
-     │
-     ▼
-选择对应的 MemoryPool
-     │
-     ├── Free List 有空闲 Slot → 直接返回
-     │
-     └── 没有可用 Slot
-             │
-             ▼
-         从 Block 分配
-             │
-             └── Block 不够 → 申请新 Block
+Application
+    ↓ allocate / deallocate
+ThreadCache（每线程）
+    ↓ 批量 Block 转移
+CentralCache（线程共享）
+    ↓ Span 分配 / 回收
+PageCache（管理 Page 与 Span）
+    ↓ 需要新内存时
+mmap
 ```
 
-这种设计比较直观。
+分配从上向下逐层寻找可用内存：ThreadCache 本地命中时不访问共享缓存；本地缺块时向 CentralCache 批量取块；CentralCache 也没有块时向 PageCache 申请 Span。释放通常先进入当前线程的缓存，之后可能批量转给 CentralCache；当某个 Span 的所有 Block 都回到 CentralCache 时，该 Span 才能交还 PageCache。
 
-但是，如果有 8 个线程同时申请 32 字节，它们就需要访问同一个 32 字节 MemoryPool 的共享分配状态。
+超过 `MAX_BYTES`（256 KiB）的请求由 ThreadCache 直接调用 `std::malloc`，释放时调用 `std::free`。这仍由 C/C++ 运行库分配器管理，不代表每次调用都会进入内核或触发系统调用。
 
-虽然 v1 通过 CAS 和 mutex 处理部分并发操作，但多个线程仍然可能竞争同一组共享资源。
+## 大小类
 
-### 2.2 v2 的改进思路
+[`include/Common.h`](include/Common.h) 定义：
 
-v2 提出一个问题：
+```cpp
+ALIGNMENT = alignof(std::max_align_t)
+MAX_BYTES = 256 * 1024
+FREE_LIST_SIZE = MAX_BYTES / ALIGNMENT
+```
 
-**能不能让线程先使用自己管理的空闲内存，尽量减少对共享内存池的访问？**
+`ALIGNMENT` 由目标平台的 `std::max_align_t` 决定，不是固定的 8 字节。请求大小向上取整到 `ALIGNMENT` 的整数倍，并据此选择从 0 开始的大小类索引。零字节请求被归一到最小大小类，因此分配和释放会选择相同的链表。
 
-这就产生了三级缓存架构：
-
-- ThreadCache（线程本地缓存）
-- CentralCache（中心缓存）
-- PageCache（页缓存）
-
-三者分别解决不同层次的问题。
-
----
-
-## 3. v2 的总体架构
-
-这是理解整个项目最重要的一张图。
+例如，若某平台 `ALIGNMENT` 为 16，25 字节请求会进入 32 字节大小类，索引为 `32 / 16 - 1 == 1`。具体值应以当前平台编译得到的常量为准。ThreadCache 为每个大小类各保存一个链表头和一个计数；其数组存储开销约为：
 
 ```text
-                    Application
-                         │
-                         ▼
-                  MemoryPool API
-                         │
-              ┌──────────┴──────────┐
-              ▼                     ▼
-          Thread A              Thread B
-              │                     │
-              ▼                     ▼
-       ┌─────────────┐       ┌─────────────┐
-       │ ThreadCache │       │ ThreadCache │
-       │   Free List │       │   Free List │
-       └──────┬──────┘       └──────┬──────┘
-              │                     │
-              └──────────┬──────────┘
-                         ▼
-                ┌────────────────┐
-                │  CentralCache  │
-                │  共享空闲链表   │
-                └────────┬───────┘
-                         │
-                         ▼
-                ┌────────────────┐
-                │   PageCache    │
-                │  管理内存 Span  │
-                └────────┬───────┘
-                         │
-                         ▼
-                mmap / OS 虚拟内存管理
+FREE_LIST_SIZE × (sizeof(void*) + sizeof(size_t))
 ```
 
-**这是一个从上到下获取内存、从下到上提供内存的架构。**
+因此，线程数量较多时，本地缓存元数据也会产生显著开销。
 
-用户申请内存时：
+## ThreadCache
 
-1. 首先访问自己的 ThreadCache。
-2. 如果本地没有可用内存，访问 CentralCache。
-3. 如果 CentralCache 也没有，访问 PageCache。
-4. 如果 PageCache 没有合适的 Span，再通过 `mmap` 获取内存。
+[`include/ThreadCache.h`](include/ThreadCache.h) 通过函数内的 `static thread_local` 对象为每个使用该接口的线程建立独立 ThreadCache。各线程的本地 Free List 不由其他线程直接访问。
 
-释放内存时，通常先归还 ThreadCache。当缓存积累太多空闲块时，再逐层向下归还。
+### 分配与批量获取
 
-不过，大于 256 KiB 的请求在当前 v2 中直接走 `malloc/free`，不经过上述完整缓存路径。
+1. 根据请求大小计算大小类索引。
+2. 本地链表非空时摘下一个 Block 并返回。
+3. 本地链表为空时调用 `CentralCache::fetchRange()`。
+4. CentralCache 最多交给 ThreadCache 32 个 Block；ThreadCache 将第一个返回给调用方，其余节点保存在本地链表。
 
----
+`freeListSize_[index]` 表示当前仍由 ThreadCache 空闲链表持有的节点数，不包括刚返回给调用方的 Block。分配本地节点时计数减一；批量取块时按实际留在本地链表的节点数更新。
 
-## 4. 三层缓存分别做什么？
+### 释放与批量归还
 
-### 4.1 ThreadCache：线程自己的内存池
+小块释放时，Block 被头插到当前线程对应大小类的本地链表，计数加一。链表数量超过 256 后，ThreadCache 保留约四分之一（至少一个节点），其余节点组成链表批量归还 CentralCache。传输时会断开保留部分与归还部分，并同步更新本地计数。
 
-ThreadCache 位于最上层，是程序最先访问的缓存。
+ThreadCache 析构时会遍历各大小类，把仍留在本地的空闲链表交给 CentralCache。CentralCache 和 PageCache 单例采用进程生命周期的动态分配，避免线程局部对象析构时访问已经销毁的单例；它们不会在进程退出前主动析构回收。
 
-它的核心特点是：**每个线程拥有自己的 ThreadCache。**
+本地重复释放检查只遍历**当前线程、当前大小类的本地空闲链表**。它可以阻止同一节点重复插入该链表，但不能作为通用的指针校验或跨线程重复释放检测机制；已转入 CentralCache 的块也不在该检查范围内。调用者仍须遵守正确的分配/释放配对规则。
 
-在 `ThreadCache.h` 中：
+## CentralCache
 
-```cpp
-static ThreadCache* getInstance()
-{
-    static thread_local ThreadCache instance;
-    return &instance;
-}
-```
+[`include/CentralCache.h`](include/CentralCache.h) 为每个大小类维护共享 Free List、一个自旋锁和一组 `SpanTracker`。`atomic_flag` 锁在对应链表和追踪元数据操作期间串行化访问；竞争时线程循环尝试并让出执行机会。
 
-这里的 `thread_local` 是关键。
+### 批量获取
 
-假设线程 A 和线程 B 分别调用 `getInstance()`：
+`fetchRange(index)` 最多从中央链表摘取 `BATCH_SIZE == 32` 个节点。批次边界确定后，函数按每个节点所属的 Span 汇总数量、校验追踪记录和计数，再更新 `freeCount`、中央链表头和批次尾指针。返回的链表与中央链表断开，交给 ThreadCache 管理。
 
-```text
-Thread A                 Thread B
-    │                        │
-    ▼                        ▼
-ThreadCache A           ThreadCache B
-    │                        │
-    ▼                        ▼
-Free List A             Free List B
-```
+中央链表为空时，CentralCache 向 PageCache 申请 Span，将其切成固定大小的 Block：最多 32 个交给 ThreadCache，其余留在 CentralCache。大 Block 类所需页数按 Block 大小计算。
 
-两个线程获取的是不同的对象。
+### 批量归还和 SpanTracker
 
-因此，当线程 A 在自己的缓存中取出一个空闲 Slot 时，一般不需要与线程 B 竞争同一把锁。
+`returnRange(start, size, index)` 根据大小类和字节数确定应归还的节点数量，遍历待归还链表，核对节点对应的 Span，并统计每个 Span 本批次归还的数量。计数检查通过后，才把链表接回中央链表并更新各追踪记录。一次归还链表可以包含多个 Span 的 Block。
 
-这是 v2 减少锁竞争的核心设计。
+每个大小类的 `spanTrackers_` 是 `std::vector<SpanTracker>`，不是固定长度追踪数组。每条记录包含 Span 起始地址、页数、总 Block 数和中央空闲 Block 数：
 
-**ThreadCache 内部存储什么？**
-
-源码中有：
-
-```cpp
-std::array<void*, FREE_LIST_SIZE> freeList_;
-
-std::array<size_t, FREE_LIST_SIZE> freeListSize_;
-```
-
-第一个数组保存各个大小类的空闲链表头。
-
-第二个数组记录每个大小类的空闲块数量。
-
-例如：
-
-```text
-ThreadCache A
-
-freeList_[0]   → 8B  → 8B  → nullptr
-freeList_[1]   → 16B → nullptr
-freeList_[2]   → nullptr
-freeList_[3]   → 32B → 32B → nullptr
-...
-```
-
-这里的 `freeList_[3]` 不是一个 32 字节的内存块，而是**指向 32 字节空闲块链表的头指针**。
-
-如果程序申请 32 字节，并且 `freeList_[3]` 不为空，就可以直接取走链表头节点。
-
-这种本地缓存命中，是我们最希望发生的快速分配路径。
-
-### 4.2 CentralCache：所有线程共享的缓存
-
-现在考虑：
-
-Thread A 需要 32 字节，但是它自己的 Free List 已经空了。
-
-怎么办？
-
-它就向 CentralCache 请求内存。
-
-CentralCache 是共享的：
-
-```text
-ThreadCache A ──┐
-                │
-ThreadCache B ──┼──→ CentralCache
-                │
-ThreadCache C ──┘
-```
-
-它负责在多个线程的本地缓存与底层 PageCache 之间提供共享的空闲内存资源。
-
-CentralCache 同样按照对象大小维护不同的 Free List。
-
-区别在于：
-
-- ThreadCache 的链表由各个线程独立管理。
-- CentralCache 的链表可能被多个线程访问，因此需要同步。
-
-项目使用按大小类划分的自旋锁（Spinlock）来保护中心链表。
-
-**为什么不让线程直接访问 PageCache？**
-
-因为访问更底层的内存管理通常涉及更多元数据操作、锁竞争，甚至新的内存映射。
-
-CentralCache 可以缓存已经切分好的小块，减少这些操作发生的次数。
-
-当前 v2 源码中的 `fetchRange()` 通常一次向线程返回一个小块，并不像一些成熟分配器那样真正执行自适应的批量获取。这是设计目标与当前实现需要区分的地方。
-
-### 4.3 PageCache：管理较大的连续内存
-
-PageCache 是最底层的缓存。
-
-它不负责给用户直接分配 8 字节、16 字节、32 字节的小对象，而是负责获取和管理较大的连续内存区域。
-
-项目中定义：
-
-```cpp
-static const size_t PAGE_SIZE = 4096;
-```
-
-也就是每个逻辑 Page 为 4096 字节。
-
-多个连续 Page 可以组成一个 Span。
-
-例如：
-
-```text
-Page = 4 KiB
-
-一个 Span：
-
-┌──────┬──────┬──────┬──────┐
-│ Page │ Page │ Page │ Page │
-└──────┴──────┴──────┴──────┘
-
-Span 大小 = 4 × 4 KiB = 16 KiB
-```
-
-PageCache 管理的就是这些 Span。
-
-当前 v2 中，CentralCache 对不超过 32 KiB 的大小类，通常尝试向 PageCache 请求一个 8 Page 的 Span。
-
-也就是：
-
-\[
-8\times4096=32768\text{ Bytes}
-\]
-
-然后 CentralCache 可以把这个 Span 切分成更小的内存块。
-
-比如切分为 32 字节的块：
-
-\[
-32768/32=1024
-\]
-
-就可以得到 1024 个 32 字节内存块。
-
-PageCache 通过 `mmap` 获取新的虚拟内存区域，同时维护空闲 Span 信息，支持部分 Span 分割和相邻合并。
-
-注意：
-
-这里的 PageCache 与数据库 Buffer Pool 不是一回事。前者管理分配器使用的内存区域；后者主要缓存磁盘上的数据库页面。
-
----
-
-## 5. 一次真实的内存分配过程
-
-我们现在把三个组件串起来。
-
-假设程序执行：
-
-```cpp
-void* ptr = MemoryPool::allocate(25);
-```
-
-### 第一步：进入 MemoryPool
-
-在 `MemoryPool.h` 中：
-
-```cpp
-static void* allocate(size_t size)
-{
-    return ThreadCache::getInstance()->allocate(size);
-}
-```
-
-这里不直接分配内存，而是把请求交给当前线程的 ThreadCache。
-
-### 第二步：确定对象属于哪个大小类
-
-在 `Common.h` 中：
-
-```cpp
-constexpr size_t ALIGNMENT = 8;
-constexpr size_t MAX_BYTES = 256 * 1024;
-constexpr size_t FREE_LIST_SIZE = MAX_BYTES / ALIGNMENT;
-```
-
-这意味着项目按照 8 字节为单位划分大小类：
-
-| Size Class | 内存块大小 |
+| 字段 | 含义 |
 |---|---|
-| 0 | 8B |
-| 1 | 16B |
-| 2 | 24B |
-| 3 | 32B |
-| 4 | 40B |
-| ... | ... |
-| 32767 | 256 KiB |
+| `blockCount` | 该 Span 按当前大小类切分出的 Block 总数 |
+| `freeCount` | 当前位于 CentralCache 空闲链表中的 Block 数 |
 
-25 字节对应的大小类是：
+`freeCount` 不统计 ThreadCache 本地缓存或用户仍在使用的 Block。中央链表取走 Block 时相应减少；归还时按所属 Span 增加。只有 `freeCount == blockCount`，CentralCache 才能摘除该 Span 的中央链表节点、删除追踪记录并把 Span 交还 PageCache。
 
-\[
-\left\lceil25/8\right\rceil=4
-\]
+查找 Block 所属 Span 时，当前实现线性扫描对应大小类的追踪器。批量归还还会遍历追踪器并扫描归还链表以按 Span 计数，因此这些路径的成本会随追踪器数量和批次长度增长。
 
-由于数组下标从 0 开始，所以：
+## PageCache
 
-\[
-index=4-1=3
-\]
+[`include/PageCache.h`](include/PageCache.h) 与 [`src/PageCache.cpp`](src/PageCache.cpp) 管理连续逻辑 Page。当前 `PAGE_SIZE` 为 4096 字节，多个连续 Page 组成 Span。
 
-因此会使用：
+- `freeSpans_` 按 Span 页数建立有序桶，每个桶的值是该页数的空闲 Span 链表。
+- `spanMap_` 按 Span 起始地址记录仍然存在的 Span 元数据，用来定位释放对象及相邻 Span。
+- `Span::isFree` 标记 Span 是否在空闲链表中。所有操作完成后的稳定状态下，`isFree == true` 当且仅当该 Span 位于 `freeSpans_`。
 
-```cpp
-freeList_[3]
+分配时，PageCache 使用 `lower_bound` 找到页数足够的空闲 Span；若较大，则切分出请求部分和尾部剩余部分，并分别维护地址映射。释放时，它先用 `spanMap_` 确认起始地址，再用 `isFree` 拒绝重复归还；随后检查地址有序映射中的前驱和右侧相邻 Span。邻居只有在确实连续且空闲链表摘除成功时才参与合并。被合并吸收的 Span 元数据和映射会删除，合并后的 Span 再按新页数加入空闲桶。
+
+没有合适的缓存 Span 时，`systemAlloc()` 使用 `mmap` 获取虚拟内存。归还 PageCache 只表示内存重新进入分配器的空闲 Span 管理；代码没有 `munmap()` 路径，因此不等于将映射归还操作系统。`std::malloc` 本身也是运行库接口，不应简单理解成每次都进行系统调用。
+
+## 核心不变式
+
+这些条件描述了操作完成后的所有权与账目关系。并发操作进行中，必须在相应锁保护下观察；不能依赖无同步的瞬时检查。
+
+1. **本地链表与计数一致**：每个大小类的 `freeListSize_` 等于 ThreadCache 本地 Free List 的实际节点数。若链表是 `A → B → nullptr`，计数就是 2。
+2. **中央计数范围明确**：`freeCount` 只数中央链表里的 Block。比如 Span 有 100 个块，中央缓存持有 40 个、本地缓存持有 20 个、用户持有 40 个，则 `blockCount == 100`、`freeCount == 40`。
+3. **整 Span 才可回收**：只有 `freeCount == blockCount`，才表明该 Span 的所有块都已回到 CentralCache；此时才可把整个 Span 交回 PageCache。
+4. **PageCache 状态与容器一致**：稳定状态下，`Span::isFree` 必须与该对象是否在 `freeSpans_` 中一致。切分、摘除、合并和重新入桶时同步更新状态。
+5. **退休元数据不能再使用**：Span 被 CentralCache 回收后，其 `SpanTracker` 删除；Span 合并后，被吸收对象的映射和元数据删除。删除后不能继续解引用对应指针。
+6. **同一在用块只能有一个所有者**：Block 从 CentralCache 取出后不再留在中央链表；ThreadCache 取出后不再留在本地链表；交给用户后，分配器不能把它再次分配给另一个调用方。
+
+## v2 中的修复与改进
+
+| 模块 | 曾发现的问题 | 当前实现方式 |
+|---|---|---|
+| ThreadCache | 零字节分配与释放可能选择不同大小类；本地计数可能下溢；空指针或本地重复释放可能破坏链表 | 大小类取整至少使用 `ALIGNMENT`；仅在摘除本地节点时减计数；忽略空指针并检查当前本地链表重复节点 |
+| ThreadCache | 线程退出时，本地空闲块可能一直留在 TLS 缓存 | 析构时逐大小类将本地空闲链表归还 CentralCache |
+| CentralCache | 单次传输数量、跨 Span 计数和追踪器生命周期需要明确管理 | 最多 32 个节点批量传输；按所属 Span 更新 `freeCount`；整 Span 回收时摘除其中央链表节点并退休追踪记录 |
+| PageCache | 空闲桶维护、分割映射、重复归还和只向右合并会影响 Span 正确性 | 维护 `isFree` 与空闲桶关系，登记分割剩余 Span，检查重复归还，并在地址映射中合并左右相邻空闲 Span |
+| 大小类 | 固定 8 字节分组不能覆盖一般 `max_align_t` 对齐 | 使用 `alignof(std::max_align_t)` 作为大小类粒度 |
+
+这张表概述当前源码能确认的实现，不代表所有边界条件都已证明无误。
+
+## 构建与测试
+
+从仓库根目录配置并构建 v2：
+
+```bash
+cmake -S v2 -B build/v2
+cmake --build build/v2 -j
 ```
 
-这里存放的都是大小为 32 字节的空闲块。
+主要 CMake 目标如下：
 
-注意，`ALIGNMENT = 8` 在这里主要定义大小类的分组粒度；它不能保证满足所有 C++ 类型的对齐要求。
-
-### 第三步：检查 ThreadCache
-
-假设：
-
-```text
-freeList_[3] → A → B → nullptr
-```
-
-那么：
-
-```cpp
-void* ptr = freeList_[3];
-```
-
-就可以从链表中取出 A。
-
-返回给用户后：
-
-```text
-freeList_[3] → B → nullptr
-```
-
-这次分配不需要访问 CentralCache，也不需要调用 `mmap`。
-
-### 第四步：如果 ThreadCache 为空
-
-假设：
-
-```text
-freeList_[3] → nullptr
-```
-
-这时执行：
-
-```cpp
-fetchFromCentralCache(index);
-```
-
-向 CentralCache 申请 32 字节的空闲块。
-
-如果 CentralCache 中存在：
-
-```text
-CentralCache[3] → C → D → E → ...
-```
-
-就可以取出一个块，例如 C，返回给 ThreadCache。
-
-### 第五步：如果 CentralCache 也为空
-
-这时 CentralCache 请求 PageCache：
-
-```text
-PageCache
-    │
-    ▼
-获得一个 8 Page 的 Span
-    │
-    ▼
-32768 Bytes
-    │
-    ▼
-切分为 1024 个 32B 小块
-    │
-    ▼
-一个返回给上层，其余留在 CentralCache
-```
-
-如果 PageCache 中没有可以复用的 Span，就调用底层 `mmap()` 申请新的内存区域。
-
-到这里，一次 25 字节的内存请求就完成了。
-
-这就是 v2 最核心的分配路径。
-
----
-
-## 6. 内存释放时发生什么？
-
-假设用户执行：
-
-```cpp
-MemoryPool::deallocate(ptr, 25);
-```
-
-首先根据传入的大小找到对应大小类：
-
-```text
-25 Bytes → Size Class 3 → 32 Bytes
-```
-
-然后将这块内存加入当前线程的 `freeList_[3]`。
-
-这和 v1 中的 Free List 头插法很相似。
-
-**但是，ThreadCache 不能无限制地保存空闲块。**
-
-如果一个线程不断释放内存，却很少重新申请，那么它的本地缓存就可能积累越来越多的空闲块。
-
-所以 v2 使用一个缓存阈值。
-
-在当前 `ThreadCache.cpp` 中：
-
-```cpp
-size_t threshold = 256;
-```
-
-当某个大小类的空闲块数量超过阈值，ThreadCache 会尝试保留一部分，把其余部分归还 CentralCache。
-
-CentralCache 又通过 SpanTracker 记录 Span 的状态，并尝试在满足条件时将完整空闲的 Span 归还 PageCache。
-
-整个设计意图是：
-
-```text
-用户释放内存
-      │
-      ▼
- ThreadCache
-      │
-      │ 空闲块过多
-      ▼
- CentralCache
-      │
-      │ 整个 Span 可以回收
-      ▼
-   PageCache
-```
-
-这里要强调：这些是架构上的回收层次。当前 v2 的回收计数和 Span 管理实现仍有需要验证的正确性问题。
-
-并且当前 PageCache 没有实现通过 `munmap()` 将空闲 Span 真正归还操作系统的完整路径。
-
-因此，**释放给内存池，不等于立刻将内存还给操作系统。**
-
----
-
-## 7. 对应到实际源码：每个文件负责什么？
-
-项目结构：
-
-```text
-v2/
-├── CMakeLists.txt
-├── include/
-│   ├── Common.h
-│   ├── MemoryPool.h
-│   ├── ThreadCache.h
-│   ├── CentralCache.h
-│   └── PageCache.h
-├── src/
-│   ├── ThreadCache.cpp
-│   ├── CentralCache.cpp
-│   └── PageCache.cpp
-└── tests/
-    ├── UnitTest.cpp
-    └── PerformanceTest.cpp
-```
-
-各文件的责任如下：
-
-| 文件 | 主要职责 |
+| 目标 | 用途 |
 |---|---|
-| `Common.h` | 定义大小类、基础常量和公共数据结构 |
-| `MemoryPool.h` | 提供对外 allocate/deallocate 接口 |
-| `ThreadCache.h/.cpp` | 线程本地 Free List、分配和回收 |
-| `CentralCache.h/.cpp` | 共享 Free List、锁、SpanTracker |
-| `PageCache.h/.cpp` | Span 管理、分割、合并和 mmap |
-| `UnitTest.cpp` | 基本正确性测试 |
-| `PerformanceTest.cpp` | 与普通内存分配方式进行性能对比 |
+| `unit_test` | 基础分配、写入、多线程、边界和压力测试 |
+| `page_cache_empty_free_list_test` | 空闲桶与仍在使用 Span 的重叠检查 |
+| `page_cache_span_mapping_test` | 分割后尾部 Span 映射与重新合并 |
+| `page_cache_double_free_test` | PageCache 重复归还 |
+| `page_cache_bidirectional_coalescing_test` | Span 双向合并 |
+| `allocator_safety_test` | CentralCache Span 回收、追踪记录和多 Span 节点管理 |
+| `zero_size_batch_return_test` | 零字节请求与批量归还后的地址复用 |
+| `thread_cache_exit_test` | TLS 缓存在线程退出时归还及后续复用 |
+| `perf_test` / `perf` | 构建性能程序 / 构建并运行性能程序 |
+| `test` | 构建并运行基础测试和上述回归测试 |
 
-三个非常重要的 C++ 知识点：
+运行单元测试和完整测试目标：
 
-**thread_local**
-
-每个线程拥有独立的 ThreadCache 实例。
-
-**Singleton（单例模式）**
-
-CentralCache 和 PageCache 通过 `getInstance()` 提供进程内共享的对象。
-
-**Atomic / Mutex / Spinlock**
-
-用于保护共享数据结构，并在性能与同步开销之间进行权衡。
-
----
-
-## 8. v2 的设计代价与目前存在的问题
-
-三级缓存不是没有成本。
-
-### 8.1 内存开销
-
-因为：
-
-```cpp
-FREE_LIST_SIZE = 32768;
+```bash
+cmake --build build/v2 --target unit_test
+./build/v2/unit_test
+cmake --build build/v2 --target test
 ```
 
-在常见 64 位环境下，ThreadCache 中两个大小为 32768 的数组，就需要约 512 KiB 的存储空间。
+运行性能程序：
 
-如果有很多线程，ThreadCache 自身的内存开销就会比较明显。
-
-### 8.2 内部碎片
-
-用户申请 25 字节，但实际分配 32 字节。
-
-多出的 7 字节在这次分配中无法供其他对象使用。
-
-### 8.3 缓存分布不均
-
-可能出现：
-
-```text
-Thread A：空闲内存很多
-Thread B：几乎没有空闲内存
+```bash
+cmake --build build/v2 --target perf
 ```
 
-由于 ThreadCache 是线程独立的，线程 B 不能直接把线程 A 的本地链表当作自己的链表使用。
+`test` 是项目自定义的 CMake target，不是已注册给 CTest 的测试套件；当前配置没有 `enable_testing()` / `add_test()`。性能程序也没有公布固定基准结果，运行结果应结合目标机器和负载自行分析。
 
-需要通过中心缓存机制协调。
+### 可选 Sanitizer 构建
 
-### 8.4 原项目仍有正确性问题值得检查
+项目没有单独配置 Sanitizer target，可用支持相应选项的 GCC 或 Clang 建立独立构建目录。ASan/UBSan 与 TSan 应分开构建：
 
-静态阅读源码，可以发现一些需要后续测试验证的点：
+```bash
+# ASan + UBSan
+cmake -S v2 -B build/v2-asan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build/v2-asan --target test -j
 
-- `ThreadCache::allocate()` 在检查链表是否为空之前，就减少了空闲块计数，存在无符号下溢和计数维护问题。
-- 小块 `deallocate()` 路径没有先检查空指针。
-- 不同大小类统一按 8 字节分组，并不能满足所有过度对齐类型的要求。
-- Span 的空闲数量统计和回收条件需要更严格的验证。
-- 部分内存回收策略尚未完整实现。
+# TSan：使用独立目录，不与 ASan 混用
+cmake -S v2 -B build/v2-tsan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+cmake --build build/v2-tsan --target thread_cache_exit_test unit_test -j
+./build/v2-tsan/thread_cache_exit_test
+./build/v2-tsan/unit_test
+```
 
-这些问题意味着 v2 更适合作为学习项目，而不是直接当作生产级分配器使用。
+Sanitizer 命令是可选的运行方式，不表示这些配置已在所有平台验证通过。由于两个共享缓存单例采用进程生命周期分配，LeakSanitizer 可能将其报告为进程结束时仍存活的对象；这与常规越界和生命周期错误需要分别判断。
 
-不过，它们也是以后开发自己的 v4 时很好的改进方向。
+## 当前限制与后续方向
 
----
+- **Span 查找成本**：`getSpanTracker()` 在线性扫描同一大小类的追踪器；归还时还要按 Span 扫描本批节点。当前实现优先保持教学可读性，没有为追踪器建立更快的地址索引。
+- **中央链表摘除成本**：回收完整 Span 时，需要遍历该大小类中央空闲链表移除属于它的节点。
+- **固定大小类与缓存占用**：每个 ThreadCache 为全部大小类保留链表头和计数数组；实际占用按 `FREE_LIST_SIZE`、指针宽度和对齐粒度变化。向上取整也会产生内部碎片。
+- **线程间缓存不均**：ThreadCache 的空闲块留在线程本地，直到达到归还阈值或线程退出；不同线程之间的负载不均可能暂时造成内存分布不均。
+- **大对象路径**：超过 256 KiB 的请求直接走 `malloc/free`，没有通过 PageCache 统一管理，也没有在本项目中实现大对象缓存策略。
+- **操作系统归还**：PageCache 没有 `munmap()` 逻辑，已映射区域会被缓存复用，直到进程结束由操作系统回收。
+- **异常与输入校验**：核心路径包含部分失败处理，但并未提供完整的生产级异常安全或任意错误指针校验。PageCache 的重复归还检查依赖有效的 Span 起始地址和内部状态；调用者仍须传入正确的指针、大小并遵守单次释放规则。
+- **重复释放检测边界**：ThreadCache 只检测当前本地链表中的重复节点；它不是全局分配状态表，不能可靠识别所有跨线程或已转入中央缓存后的无效释放。
+- **测试范围**：现有测试覆盖若干回归路径和基础并发场景，但不等同于穷举验证；`UnitTest.cpp` 的一部分检查使用 `assert`，在定义 `NDEBUG` 时会被移除。
+- **性能验证**：自带性能程序使用有限的分配模式做对比，不是严谨的通用基准；未提供可复现的性能结论或提升比例。
 
-## 9. 推荐的源码学习顺序
+## 阅读顺序
 
-建议按照一次内存请求的执行路径阅读，而不是按文件名从头到尾逐行阅读。
-
-**第一阶段：理解分配流程**
-
-1. `MemoryPool.h`：找到入口。
-2. `Common.h`：理解大小类映射。
-3. `ThreadCache.h`：理解 `thread_local` 和 Free List 数组。
-4. `ThreadCache.cpp::allocate()`：理解本地分配。
-5. `CentralCache.cpp::fetchRange()`：理解共享缓存。
-6. `PageCache.cpp::allocateSpan()`：理解 Span 从哪里来。
-
-**第二阶段：理解释放流程**
-
-从 `ThreadCache::deallocate()` 开始，沿着 `returnToCentralCache()`、`CentralCache::returnRange()` 继续向下追踪。
-
-**第三阶段：理解并发与优化**
-
-最后再研究自旋锁、原子操作、SpanTracker、延迟归还机制以及 Benchmark。
-
-这样可以先建立整体调用关系，再进入复杂细节。
-
----
-
-## 10. 最后总结
-
-v2 最核心的设计思想可以用三句话概括：
-
-**ThreadCache：** 尽量在当前线程内部完成分配，避免锁竞争。
-
-**CentralCache：** 维护线程之间共享的空闲内存块，为 ThreadCache 提供补充。
-
-**PageCache：** 管理较大连续内存区域，并在需要时向底层申请新的内存。
-
-用户申请内存时，通常沿着：
-
-`ThreadCache → CentralCache → PageCache → mmap`
-
-寻找可用空间。
-
-这个架构最重要的并不是某一个具体函数，而是**通过分层缓存，让大部分高频分配发生在成本较低、竞争较少的位置**。
+1. [`include/MemoryPool.h`](include/MemoryPool.h)：对外入口。
+2. [`include/Common.h`](include/Common.h)：大小类及边界常量。
+3. [`src/ThreadCache.cpp`](src/ThreadCache.cpp)：本地分配、归还和线程退出处理。
+4. [`src/CentralCache.cpp`](src/CentralCache.cpp)：批量链表操作及 SpanTracker 计数。
+5. [`src/PageCache.cpp`](src/PageCache.cpp)：Span 分割、状态维护与双向合并。
+6. [`tests/`](tests/) 与 [`CMakeLists.txt`](CMakeLists.txt)：回归场景及其构建目标。
 
