@@ -1,12 +1,14 @@
 #pragma once
+#include <algorithm>
 #include <cstddef>
 #include <atomic>
 #include <array>
+#include <cstdint>
 
 namespace Kama_memoryPool 
 {
 // 对齐数和大小定义
-constexpr size_t ALIGNMENT = 8; // 内存块对齐为8字节
+constexpr size_t ALIGNMENT = alignof(std::max_align_t);
 constexpr size_t MAX_BYTES = 256 * 1024; // 256KB
 constexpr size_t FREE_LIST_SIZE = MAX_BYTES / ALIGNMENT; // ALIGNMENT等于指针void*的大小
 

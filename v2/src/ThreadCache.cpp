@@ -22,14 +22,12 @@ void* ThreadCache::allocate(size_t size)
     // 根据大小计算对应的索引
     size_t index = SizeClass::getIndex(size);
     
-    // 更新对应自由链表的长度计数
-    freeListSize_[index]--;
-    
     // 检查线程本地自由链表
     // 如果 freeList_[index] 不为空，表示该链表中有可用内存块
     if (void *ptr = freeList_[index]) {
         // 单向链表的头删法
         freeList_[index] = *reinterpret_cast<void**>(ptr); // 将freeList_[index]指向的内存块的下一个内存块地址（取决于内存块的实现）
+        --freeListSize_[index];
         return ptr;
     }
     
@@ -41,6 +39,8 @@ void* ThreadCache::allocate(size_t size)
 // size 是用户申请的大小，可能不是对齐后的大小
 // *ptr 是用户申请的内存块的起始地址
 void ThreadCache::deallocate(void *ptr, size_t size) {
+    if (!ptr) return;
+
     // size > MAX_BYTES 的情况直接释放内存
     // 因为是直接从系统分配的内存，所以直接释放即可
     if (size > MAX_BYTES)
@@ -50,6 +50,12 @@ void ThreadCache::deallocate(void *ptr, size_t size) {
     }
 
     size_t index = SizeClass::getIndex(size);
+
+    // 检查当前线程缓存中的重复释放，避免重复链入同一个节点。
+    for (void* current = freeList_[index]; current;
+         current = *reinterpret_cast<void**>(current)) {
+        if (current == ptr) return;
+    }
 
     // 插入到线程本地自由链表
     *reinterpret_cast<void**>(ptr) = freeList_[index];
@@ -84,19 +90,11 @@ void* ThreadCache::fetchFromCentralCache(size_t index)
     void* result = start;
     freeList_[index] = *reinterpret_cast<void**>(start);
     
-    // 更新自由链表大小
-    size_t batchNum = 0;
-    void* current = start; // 从start开始遍历
-
-    // 计算从中心缓存获取的内存块数量
-    while (current != nullptr)
-    {
-        batchNum++;
-        current = *reinterpret_cast<void**>(current); // 遍历下一个内存块
+    // start 已交给调用方；计数只统计仍留在线程本地链表的节点。
+    for (void* current = freeList_[index]; current;
+         current = *reinterpret_cast<void**>(current)) {
+        ++freeListSize_[index];
     }
-
-    // 更新freeListSize_，增加获取的内存块数量
-    freeListSize_[index] += batchNum;
     
     return result;
 }

@@ -64,6 +64,12 @@ add_executable(page_cache_bidirectional_coalescing_test
     ${TEST_DIR}/PageCacheBidirectionalCoalescingTest.cpp
 )
 
+# 三级缓存 Span 生命周期、追踪器与对象安全回归测试
+add_executable(allocator_safety_test
+    ${SOURCES}
+    ${TEST_DIR}/AllocatorSafetyTest.cpp
+)
+
 # PageCache 回归测试
 add_executable(pagecache_test
     ${SRC_DIR}/PageCache.cpp
@@ -79,6 +85,7 @@ target_link_libraries(page_cache_span_mapping_test PRIVATE Threads::Threads)
 target_link_libraries(page_cache_span_coalescing_test PRIVATE Threads::Threads)
 target_link_libraries(page_cache_double_free_test PRIVATE Threads::Threads)
 target_link_libraries(page_cache_bidirectional_coalescing_test PRIVATE Threads::Threads)
+target_link_libraries(allocator_safety_test PRIVATE Threads::Threads)
 target_link_libraries(pagecache_test PRIVATE Threads::Threads)
 
 # 添加测试命令
