@@ -5,6 +5,25 @@
 namespace Kama_memoryPool
 {
 
+ThreadCache::~ThreadCache()
+{
+    // 线程退出时，所有剩余本地块都转交给 CentralCache。
+    for (size_t index = 0; index < FREE_LIST_SIZE; ++index) {
+        void* head = freeList_[index];
+        const size_t blockCount = freeListSize_[index];
+        if (!head || blockCount == 0) continue;
+
+        freeList_[index] = nullptr;
+        freeListSize_[index] = 0;
+        try {
+            CentralCache::getInstance().returnRange(
+                head, blockCount * (index + 1) * ALIGNMENT, index);
+        } catch (...) {
+            // 析构函数不得抛出异常；失败时进程仍能安全退出。
+        }
+    }
+}
+
 void* ThreadCache::allocate(size_t size)
 {
     // 处理0大小的分配请求
@@ -89,6 +108,7 @@ void* ThreadCache::fetchFromCentralCache(size_t index)
     // 取一个返回，其余放入自由链表
     void* result = start;
     freeList_[index] = *reinterpret_cast<void**>(start);
+    freeListSize_[index] = 0;
     
     // start 已交给调用方；计数只统计仍留在线程本地链表的节点。
     for (void* current = freeList_[index]; current;
